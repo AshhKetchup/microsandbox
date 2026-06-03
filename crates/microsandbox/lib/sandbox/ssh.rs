@@ -11,7 +11,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
-use microsandbox_protocol::fs::FS_CHUNK_SIZE;
+use microsandbox_protocol::{fs::FS_CHUNK_SIZE, message::MessageType};
 use russh::client::Msg as ClientMsg;
 use russh::keys::{Algorithm, PrivateKey, PrivateKeyWithHashAlg, PublicKeyBase64, load_secret_key};
 use russh::server::{Auth, Msg, Session};
@@ -20,10 +20,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::attach;
 use crate::sandbox::exec::{ExecControl, ExecEvent, ExecOptions, ExecSink, StdinMode};
-use crate::{
-    MicrosandboxError, MicrosandboxResult, Sandbox,
-    agent::{AgentClient, AgentClientError},
-};
+use crate::{MicrosandboxError, MicrosandboxResult, Sandbox, agent::AgentClient};
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -100,9 +97,10 @@ pub struct SshClient {
     handle: russh::client::Handle<SshClientHandler>,
     term: String,
     server_task: Option<tokio::task::JoinHandle<MicrosandboxResult<()>>>,
-    // TODO(upgrade-0.6): Remove in 0.6.x or later once live-sandbox
-    // compatibility for versions before 0.5 is no longer supported.
-    legacy_agent: bool,
+    /// Protocol generation negotiated with the sandbox, captured at connect.
+    /// SFTP rides on the filesystem protocol, so it is gated against this through
+    /// `AgentClient::ensure_version_compat_for`.
+    negotiated_version: u8,
 }
 
 /// High-level SFTP client session.
@@ -281,7 +279,7 @@ impl SandboxSsh {
             handle: client,
             term,
             server_task: Some(server_task),
-            legacy_agent: self.sandbox.client().is_legacy_protocol(),
+            negotiated_version: self.sandbox.client().negotiated_version(),
         })
     }
 
@@ -637,15 +635,16 @@ impl SshClient {
         Ok(exit_code)
     }
 
+    /// Reject SFTP on a sandbox too old for the filesystem protocol it rides on,
+    /// with the same consolidated error as a direct filesystem call.
+    fn ensure_sftp_supported(&self) -> MicrosandboxResult<()> {
+        AgentClient::ensure_version_compat_for(MessageType::FsRequest, self.negotiated_version)?;
+        Ok(())
+    }
+
     /// Open an SFTP client session over this SSH connection.
     pub async fn sftp(&self) -> MicrosandboxResult<SftpClient> {
-        if self.legacy_agent {
-            // TODO(upgrade-0.6): Remove in 0.6.x or later once live-sandbox
-            // compatibility for versions before 0.5 is no longer supported.
-            return Err(MicrosandboxError::AgentClient(
-                AgentClientError::Pre05SandboxRestartRequired,
-            ));
-        }
+        self.ensure_sftp_supported()?;
 
         let mut channel = self
             .handle
@@ -1023,9 +1022,10 @@ impl russh::server::Handler for SshSession {
         };
 
         let client = self.agent_client().await?;
-        if client.is_legacy_protocol() {
-            // TODO(upgrade-0.6): Remove in 0.6.x or later once live-sandbox
-            // compatibility for versions before 0.5 is no longer supported.
+        if !client.supports(MessageType::FsRequest) {
+            // SFTP rides on the filesystem protocol; reject the subsystem on a
+            // sandbox too old for it. TODO(upgrade-0.6): Remove in 0.6.x or later
+            // once live-sandbox compatibility for versions before 0.5 is dropped.
             session.channel_failure(channel)?;
             return Ok(());
         }
